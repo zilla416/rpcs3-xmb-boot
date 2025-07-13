@@ -231,7 +231,7 @@ CellError process_is_spu_lock_line_reservation_address(u32 addr, u64 flags)
 		return CELL_EPERM;
 	default:
 	{
-		if (auto vm0 = idm::get_unlocked<sys_vm_t>(sys_vm_t::find_id(addr)))
+		if (auto vm0 = idm::get<sys_vm_t>(sys_vm_t::find_id(addr)))
 		{
 			// sys_vm area was not covering the address specified but made a reservation on the entire 256mb region
 			if (vm0->addr + vm0->size - 1 < addr)
@@ -271,7 +271,7 @@ error_code _sys_process_get_paramsfo(vm::ptr<char> buffer)
 {
 	sys_process.warning("_sys_process_get_paramsfo(buffer=0x%x)", buffer);
 
-	if (Emu.GetTitleID().empty())
+	if (!Emu.GetTitleID().length())
 	{
 		return CELL_ENOENT;
 	}
@@ -340,8 +340,6 @@ error_code sys_process_detach_child(u64 unk)
 	return CELL_OK;
 }
 
-extern void signal_system_cache_can_stay();
-
 void _sys_process_exit(ppu_thread& ppu, s32 status, u32 arg2, u32 arg3)
 {
 	ppu.state += cpu_flag::wait;
@@ -351,7 +349,6 @@ void _sys_process_exit(ppu_thread& ppu, s32 status, u32 arg2, u32 arg3)
 	Emu.CallFromMainThread([]()
 	{
 		sys_process.success("Process finished");
-		signal_system_cache_can_stay();
 		Emu.Kill();
 	});
 
@@ -415,7 +412,10 @@ void lv2_exitspawn(ppu_thread& ppu, std::vector<std::string>& argv, std::vector<
 	// sys_sm_shutdown
 	const bool is_real_reboot = (ppu.gpr[11] == 379);
 
-	Emu.CallFromMainThread([is_real_reboot, argv = std::move(argv), envp = std::move(envp), data = std::move(data)]() mutable
+	// sys_process_spawns_a_self2
+	const bool is_another_game = (ppu.gpr[11] == 27);
+
+	Emu.CallFromMainThread([is_real_reboot, is_another_game, argv = std::move(argv), envp = std::move(envp), data = std::move(data)]() mutable
 	{
 		sys_process.success("Process finished -> %s", argv[0]);
 
@@ -433,29 +433,16 @@ void lv2_exitspawn(ppu_thread& ppu, std::vector<std::string>& argv, std::vector<
 
 		using namespace id_manager;
 
-		shared_ptr<utils::serial> idm_capture = make_shared<utils::serial>();
-
-		if (!is_real_reboot)
-		{
-			reader_lock rlock{id_manager::g_mutex};
-			g_fxo->get<id_map<lv2_memory_container>>().save(*idm_capture);
-			stx::serial_breathe_and_tag(*idm_capture, "id_map<lv2_memory_container>", false);
-		}
-
-		idm_capture->set_reading_state();
-
-		auto func = [is_real_reboot, old_size = g_fxo->get<lv2_memory_container>().size, idm_capture](u32 sdk_suggested_mem) mutable
+		auto func = [is_real_reboot, old_size = g_fxo->get<lv2_memory_container>().size, vec = (reader_lock{g_mutex}, g_fxo->get<id_map<lv2_memory_container>>().vec)](u32 sdk_suggested_mem) mutable
 		{
 			if (is_real_reboot)
 			{
 				// Do not save containers on actual reboot
-				ensure(g_fxo->init<id_map<lv2_memory_container>>());
+				vec.clear();
 			}
-			else
-			{
-				// Save LV2 memory containers
-				ensure(g_fxo->init<id_map<lv2_memory_container>>(*idm_capture));
-			}
+
+			// Save LV2 memory containers
+			ensure(g_fxo->init<id_map<lv2_memory_container>>())->vec = std::move(vec);
 
 			// Empty the containers, accumulate their total size
 			u32 total_size = 0;
@@ -472,24 +459,27 @@ void lv2_exitspawn(ppu_thread& ppu, std::vector<std::string>& argv, std::vector<
 			ensure(g_fxo->init<lv2_memory_container>(std::min(old_size - total_size, sdk_suggested_mem) + total_size));
 		};
 
-		Emu.after_kill_callback = [func = std::move(func), argv = std::move(argv), envp = std::move(envp), data = std::move(data),
+		Emu.after_kill_callback = [is_another_game, func = std::move(func), argv = std::move(argv), envp = std::move(envp), data = std::move(data),
 			disc = std::move(disc), path = std::move(path), hdd1 = std::move(hdd1), old_config = Emu.GetUsedConfig(), klic]() mutable
 		{
-			Emu.argv = std::move(argv);
-			Emu.envp = std::move(envp);
-			Emu.data = std::move(data);
-			Emu.disc = std::move(disc);
-			Emu.hdd1 = std::move(hdd1);
-			Emu.init_mem_containers = std::move(func);
-
-			if (klic)
+			if (!is_another_game)
 			{
-				Emu.klic.emplace_back(klic);
+				Emu.argv = std::move(argv);
+				Emu.envp = std::move(envp);
+				Emu.data = std::move(data);
+				Emu.disc = std::move(disc);
+				Emu.hdd1 = std::move(hdd1);
+				Emu.init_mem_containers = std::move(func);
+
+				if (klic)
+				{
+					Emu.klic.emplace_back(klic);
+				}
 			}
 
 			Emu.SetForceBoot(true);
 
-			auto res = Emu.BootGame(path, "", true, cfg_mode::continuous, old_config);
+			auto res = Emu.BootGame(path, "", true, is_another_game ? cfg_mode::custom : cfg_mode::continuous, is_another_game ? "" : old_config);
 
 			if (res != game_boot_result::no_errors)
 			{
@@ -497,10 +487,6 @@ void lv2_exitspawn(ppu_thread& ppu, std::vector<std::string>& argv, std::vector<
 			}
 		};
 
-		signal_system_cache_can_stay();
-
-		// Make sure we keep the game window opened
-		Emu.SetContinuousMode(true);
 		Emu.Kill(false);
 	});
 
@@ -525,10 +511,42 @@ void sys_process_exit3(ppu_thread& ppu, s32 status)
 	return _sys_process_exit(ppu, status, 0, 0);
 }
 
-error_code sys_process_spawns_a_self2(vm::ptr<u32> pid, u32 primary_prio, u64 flags, vm::ptr<void> stack, u32 stack_size, u32 mem_id, vm::ptr<void> param_sfo, vm::ptr<void> dbg_data)
+error_code sys_process_spawns_a_self2(ppu_thread& ppu, vm::ptr<u32> pid, u32 primary_prio, u64 flags, vm::ptr<spawn_self_stack> stack, u32 stack_size, u32 mem_id, vm::ptr<void> param_sfo, vm::ptr<void> dbg_data)
 {
-	sys_process.todo("sys_process_spawns_a_self2(pid=*0x%x, primary_prio=0x%x, flags=0x%llx, stack=*0x%x, stack_size=0x%x, mem_id=0x%x, param_sfo=*0x%x, dbg_data=*0x%x"
+	ppu.state += cpu_flag::wait;
+
+	sys_process.warning("sys_process_spawns_a_self2(pid=*0x%x, primary_prio=0x%x, flags=0x%llx, stack=*0x%x, stack_size=0x%x, mem_id=0x%x, param_sfo=*0x%x, dbg_data=*0x%x"
 		, pid, primary_prio, flags, stack, stack_size, mem_id, param_sfo, dbg_data);
+
+	if (!g_ps3_process_info.debug_or_root())
+		return CELL_ENOSYS;
+
+	if (!pid || !stack || !param_sfo || !dbg_data)
+		return CELL_EFAULT;
+
+	if (stack_size < sizeof(spawn_self_stack))
+		return CELL_EINVAL;
+
+	std::string_view self_path{stack->self_path, sizeof(stack->self_path)};
+
+	if (const auto trim_start = self_path.find_first_not_of('\0'); trim_start != umax)
+		self_path.remove_prefix(trim_start);
+
+	if (const auto trim_end = self_path.find_first_of('\0'); trim_end != umax)
+		self_path.remove_suffix(self_path.size() - trim_end);
+
+	sys_process.notice("SELF path: %s", self_path);
+
+	if (self_path.ends_with("/USRDIR/EBOOT.BIN"sv)) // Only process game boot currently
+	{
+		std::vector<std::string> argv;
+		std::vector<std::string> envp;
+		std::vector<u8> data;
+
+		argv.emplace_back(self_path);
+
+		lv2_exitspawn(ppu, argv, envp, data);
+	}
 
 	return CELL_OK;
 }
